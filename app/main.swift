@@ -272,6 +272,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
             forName: showNoteName, object: nil, queue: .main) { [weak self] _ in self?.showPopover() }
         DistributedNotificationCenter.default().addObserver(
             forName: Notification.Name("com.ck.macmon.window"), object: nil, queue: .main) { [weak self] _ in self?.showDashboard() }
+        DistributedNotificationCenter.default().addObserver(
+            forName: Notification.Name("com.ck.macmon.settings"), object: nil, queue: .main) { [weak self] _ in self?.showSettings() }
         // 调试：把弹窗/窗口自己渲染成 PNG（无需屏幕录制权限）→ ~/.macmon/shot-*.png
         DistributedNotificationCenter.default().addObserver(
             forName: Notification.Name("com.ck.macmon.snapshot"), object: nil, queue: .main) { [weak self] _ in MainActor.assumeIsolated {
@@ -295,7 +297,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
 
     private func wireModel() {
         model.agentOn = agentInstalled()
-        model.kill = { [weak self] name, pids in self?.confirmKill(name: name, pids: pids) }
+        model.terminate = { [weak self] name, pids in self?.performKill(name: name, pids: pids) }
         model.openWindow = { [weak self] in self?.showDashboard() }
         model.openSettings = { [weak self] in self?.showSettings() }
         model.togglePause = { [weak self] in
@@ -521,7 +523,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
             }
         }
         if let w = dashWindow, w.isVisible { save(w.contentView, "window") }
-        if let w = settingsWindow, w.isVisible { save(w.contentView, "settings") }
+        if let w = settingsWindow, w.isVisible, let tabs = w.contentViewController as? NSTabViewController {
+            let keep = tabs.selectedTabViewItemIndex
+            for i in 0..<tabs.tabViewItems.count {
+                tabs.selectedTabViewItemIndex = i
+                w.contentView?.layoutSubtreeIfNeeded()
+                RunLoop.current.run(until: Date().addingTimeInterval(0.3))
+                save(w.contentView, "settings-\(i)")
+            }
+            tabs.selectedTabViewItemIndex = keep
+        }
+        // 行内“确认结束”状态预览
+        if let a = latest.apps.first {
+            let r = RowItem(id: a.name, name: a.name, path: a.appPath, count: a.pids.count, pid: a.mainPid, pct: a.pct,
+                            mem: a.mem, disk: a.diskRate, conns: a.conns, listens: a.listens, pids: a.pids)
+            let v = VStack(spacing: 0) {
+                AppRow(m: model, r: r, sort: .cpu, previewConfirming: true)
+                ToastView(t: Model.Toast(text: "已结束 \(a.name)", ok: true)).padding(.top, 8)
+            }.padding(12).frame(width: 400).background(Color(white: 0.96)).environment(\.colorScheme, .light)
+            let rr = ImageRenderer(content: v)
+            rr.scale = 2
+            if let img = rr.nsImage, let tiff = img.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff) {
+                try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: macmonDir + "/shot-confirm.png"))
+            }
+        }
     }
 
     private func showDashboard() {
@@ -553,19 +578,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
     private func showSettings() {
         popover.performClose(nil)
         if settingsWindow == nil {
-            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 460, height: 560),
-                             styleMask: [.titled, .closable], backing: .buffered, defer: false)
-            w.title = "MacMon 设置"
+            // 系统偏好设置风格：顶部工具栏图标标签页，每页固定尺寸、内容自己滚动
+            let tabs = NSTabViewController()
+            tabs.tabStyle = .toolbar
+            tabs.canPropagateSelectedChildViewControllerTitle = true
+            let size = NSSize(width: 540, height: 500)
+            func page<V: View>(_ title: String, _ symbol: String, _ v: V) {
+                let hc = NSHostingController(rootView: v.frame(minWidth: size.width, minHeight: 360))
+                hc.preferredContentSize = size
+                hc.title = title
+                let item = NSTabViewItem(viewController: hc)
+                item.label = title
+                item.image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)
+                tabs.addTabViewItem(item)
+            }
+            page("提醒", "bell.badge", AlertSettingsView())
+            page("自动处理", "bolt.shield", AutoKillSettingsView(m: model))
+            page("通用", "gearshape", GeneralSettingsView(m: model))
+
+            let w = NSWindow(contentViewController: tabs)
+            w.styleMask = [.titled, .closable, .resizable]
+            w.toolbarStyle = .preference
             w.isReleasedWhenClosed = false
-            let hc = NSHostingController(rootView: SettingsView(m: model))
-            hc.sizingOptions = .preferredContentSize   // 展开/收起「自动处理」时窗口自动跟着变高
-            w.contentViewController = hc
+            w.setContentSize(size)
+            w.contentMinSize = NSSize(width: size.width, height: 360)
             w.center()
+            w.setFrameAutosaveName("MacMonSettings")
             settingsWindow = w
         }
         model.snap = latest   // 让「添加正在运行的应用」列表是最新的
         NSApp.activate(ignoringOtherApps: true)
         settingsWindow?.makeKeyAndOrderFront(nil)
+        // 打开时不要自动选中第一个输入框
+        DispatchQueue.main.async { [weak self] in self?.settingsWindow?.makeFirstResponder(nil) }
     }
 
     // ---------- 通知 ----------
@@ -595,39 +640,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
 
     // ---------- 结束进程 ----------
 
-    private func confirmKill(name: String, pids: [pid_t]) {
-        let me = getpid()
-        let targets = pids.filter { $0 > 1 && $0 != me }
-        guard !targets.isEmpty else { return }
-        popover.performClose(nil)
-        let a = NSAlert()
-        a.messageText = targets.count > 1 ? "结束「\(name)」？" : "结束进程「\(name)」？"
-        a.informativeText = (targets.count > 1 ? "将结束该应用的全部 \(targets.count) 个进程，未保存的内容可能丢失。\n\n" : "PID \(targets[0])。\n\n")
-            + "先请求正常退出，3 秒后仍未退出则强制结束。"
-        a.alertStyle = .warning
-        a.addButton(withTitle: "结束")
-        a.addButton(withTitle: "取消")
-        NSApp.activate(ignoringOtherApps: true)
-        guard a.runModal() == .alertFirstButtonReturn else { return }
-
-        var denied = 0
-        for p in targets where kill(p, SIGTERM) != 0 && errno == EPERM { denied += 1 }
-        logger.write("kill \(name) \(targets) — SIGTERM")
-        if denied == targets.count {
-            postUN("macmon.kill.\(name)", "⛔️ 无法结束 \(name)", "这是系统或其他用户的进程，没有权限。")
-            return
-        }
-        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 3.0) { [weak self] in
-            let alive = targets.filter { kill($0, 0) == 0 }
-            alive.forEach { kill($0, SIGKILL) }
-            if !alive.isEmpty { self?.logger.write("kill \(name) \(alive) — SIGKILL（强制）") }
-            DispatchQueue.main.async {
-                if alive.isEmpty {
-                    self?.postUN("macmon.kill.\(name)", "✅ 已结束 \(name)", "已正常退出。")
-                } else {
-                    self?.postUN("macmon.kill.\(name)", "🔨 已强制结束 \(name)", "\(alive.count) 个进程无响应，已强制结束。")
-                }
+    /// 手动结束（确认已在行内完成）：不关弹窗、不弹系统对话框，结果在界面底部提示
+    private func performKill(name: String, pids: [pid_t]) {
+        guard !model.killing.contains(name) else { return }
+        model.killing.insert(name)
+        logger.write("手动结束 \(name) \(pids)")
+        terminatePids(pids) { [weak self] forced, denied in
+            guard let self = self else { return }
+            self.model.killing.remove(name)
+            let text: String
+            let ok: Bool
+            if denied {
+                text = "无法结束 \(name)：系统或其他用户的进程，没有权限"
+                ok = false
+            } else if forced > 0 {
+                text = "已强制结束 \(name)（\(forced) 个进程无响应）"
+                ok = true
+            } else {
+                text = "已结束 \(name)"
+                ok = true
             }
+            self.logger.write(text)
+            self.model.showToast(text, ok: ok)
+            // 弹窗/窗口已关上看不到提示时，才发系统通知
+            if !self.uiVisible { self.postUN("macmon.kill.\(name)", ok ? "✅ \(text)" : "⛔️ \(text)", "") }
         }
     }
 

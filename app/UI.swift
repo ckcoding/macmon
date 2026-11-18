@@ -127,7 +127,25 @@ final class Model: ObservableObject {
     @Published private var iconTick = 0
 
     /// 由 AppDelegate 注入的动作
-    var kill: (String, [pid_t]) -> Void = { _, _ in }
+    var terminate: (String, [pid_t]) -> Void = { _, _ in }
+    /// 正在结束中的应用/进程名（行内显示“正在结束…”）
+    @Published var killing: Set<String> = []
+    /// 底部的轻提示（几秒后自动消失）
+    @Published var toast: Toast?
+
+    struct Toast: Equatable {
+        let id = UUID()
+        let text: String
+        let ok: Bool
+    }
+
+    func showToast(_ text: String, ok: Bool) {
+        let t = Toast(text: text, ok: ok)
+        toast = t
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
+            if self?.toast == t { self?.toast = nil }
+        }
+    }
     var openWindow: () -> Void = {}
     var openSettings: () -> Void = {}
     var togglePause: () -> Void = {}
@@ -564,6 +582,12 @@ struct AppRow: View {
     var wide = false
     @State private var hover = false
     @State private var showConns = false
+    @State private var confirming = false
+
+    init(m: Model, r: RowItem, sort: SortKey, wide: Bool = false, previewConfirming: Bool = false) {
+        self.m = m; self.r = r; self.sort = sort; self.wide = wide
+        _confirming = State(initialValue: previewConfirming)
+    }
 
     var body: some View {
         HStack(spacing: 8) {
@@ -575,6 +599,24 @@ struct AppRow: View {
                     .background(Color.secondary.opacity(0.12), in: Capsule())
             }
             Spacer(minLength: 6)
+            if m.killing.contains(r.name) {
+                ProgressView().controlSize(.small).scaleEffect(0.8)
+                Text("正在结束…").font(.system(size: 11.5)).foregroundStyle(.secondary)
+            } else if confirming {
+                Text(r.count > 1 ? "结束全部 \(r.count) 个进程？" : "结束？")
+                    .font(.system(size: 11.5, weight: .medium)).foregroundStyle(.red)
+                    .lineLimit(1).fixedSize()
+                Button("取消") { confirming = false }
+                    .controlSize(.small)
+                    .keyboardShortcut(.cancelAction)
+                Button("结束") {
+                    confirming = false
+                    m.terminate(r.name, r.pids)
+                }
+                .controlSize(.small)
+                .buttonStyle(.borderedProminent)
+                .tint(.red)
+            } else {
             if wide {
                 Group {
                     Text(r.count > 1 ? "\(r.count) 个" : String(r.pid)).frame(width: 60, alignment: .trailing).foregroundStyle(.secondary)
@@ -602,18 +644,27 @@ struct AppRow: View {
             .popover(isPresented: $showConns, arrowEdge: .trailing) {
                 ConnectionsView(m: m, dns: m.dns, name: r.name, path: r.path, pids: r.pids)
             }
-            Button { m.kill(r.name, r.pids) } label: {
+            Button { confirming = true } label: {
                 Image(systemName: "xmark.circle.fill").font(.system(size: 13))
                     .foregroundStyle(hover ? Color.red.opacity(0.85) : Color.secondary.opacity(0.0))
             }
             .buttonStyle(.plain)
             .help(r.count > 1 ? "结束 \(r.name) 的全部 \(r.count) 个进程" : "结束 \(r.name)")
             .disabled(!hover)
+            }
         }
         .padding(.horizontal, 8).padding(.vertical, wide ? 5 : 4)
-        .background(hover ? Color.primary.opacity(0.06) : .clear, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+        .background(confirming ? Color.red.opacity(0.10) : (hover ? Color.primary.opacity(0.06) : .clear),
+                    in: RoundedRectangle(cornerRadius: 7, style: .continuous))
         .contentShape(Rectangle())
         .onHover { hover = $0 }
+        .animation(.easeOut(duration: 0.15), value: confirming)
+        .task(id: confirming) {
+            // 6 秒没点就自动取消，避免误触留着一个“待确认”状态
+            guard confirming else { return }
+            try? await Task.sleep(nanoseconds: 6_000_000_000)
+            confirming = false
+        }
     }
 
     private var value: String {
@@ -675,10 +726,27 @@ struct HeaderView: View {
     }
 }
 
+struct ToastView: View {
+    let t: Model.Toast
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: t.ok ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                .foregroundStyle(t.ok ? .green : .orange)
+            Text(t.text).font(.system(size: 11.5)).lineLimit(2)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 10).padding(.vertical, 7)
+        .background((t.ok ? Color.green : Color.orange).opacity(0.12), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .transition(.move(edge: .bottom).combined(with: .opacity))
+    }
+}
+
 struct FooterView: View {
     @ObservedObject var m: Model
     var showWindowButton = true
     var body: some View {
+        VStack(spacing: 8) {
+        if let t = m.toast { ToastView(t: t) }
         HStack(spacing: 12) {
             Text(String(format: "MacMon 自身 %.1f%% CPU · %@ · 采样 %.1f ms", m.snap.me.cpuPct, bytes(m.snap.me.footprint), m.snap.me.tickMs))
                 .font(.system(size: 10)).foregroundStyle(.tertiary).monospacedDigit()
@@ -704,6 +772,8 @@ struct FooterView: View {
         .buttonStyle(.borderless)
         .font(.system(size: 13))
         .foregroundStyle(.secondary)
+        }
+        .animation(.easeOut(duration: 0.2), value: m.toast)
     }
 }
 
@@ -827,10 +897,37 @@ struct VisualEffect: NSViewRepresentable {
     func updateNSView(_ nsView: NSVisualEffectView, context: Context) {}
 }
 
-// MARK: - 设置
+// MARK: - 设置（工具栏标签页：提醒 / 自动处理 / 通用；每页独立滚动）
 
-struct SettingsView: View {
-    @ObservedObject var m: Model
+/// 统一的数字设置行：左标签，右侧输入框 + 单位（单位列等宽，所有输入框对齐）
+struct NumberRow: View {
+    let label: String
+    @Binding var value: Double
+    let unit: String
+    var body: some View {
+        LabeledContent(label) {
+            HStack(spacing: 6) {
+                TextField("", value: $value, format: .number)
+                    .labelsHidden()
+                    .multilineTextAlignment(.trailing)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 70)
+                Text(unit).foregroundStyle(.secondary).frame(width: 34, alignment: .leading)
+            }
+        }
+    }
+}
+
+struct SectionNote: View {
+    let text: String
+    init(_ t: String) { text = t }
+    var body: some View {
+        Text(text).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+struct AlertSettingsView: View {
     @AppStorage(K.cpu) private var cpu = 85.0
     @AppStorage(K.cpuSustainSec) private var cpuSec = 30.0
     @AppStorage(K.mem) private var mem = 92.0
@@ -842,110 +939,140 @@ struct SettingsView: View {
     @AppStorage(K.appConn) private var appConn = 500.0
     @AppStorage(K.cooldownMin) private var cooldown = 10.0
     @AppStorage(K.soundOn) private var sound = true
-    @AppStorage(AK.on) private var akOn = false
-    @AppStorage(AK.list) private var akList = ""
-    @AppStorage(AK.cpu) private var akCpu = 200.0
-    @AppStorage(AK.cpuSec) private var akCpuSec = 180.0
-    @AppStorage(AK.memGB) private var akMem = 3.0
+
+    var body: some View {
+        Form {
+            Section {
+                NumberRow(label: "CPU 占用超过", value: $cpu, unit: "%")
+                NumberRow(label: "并持续", value: $cpuSec, unit: "秒")
+                NumberRow(label: "内存占用超过", value: $mem, unit: "%")
+                NumberRow(label: "或可用内存低于", value: $avail, unit: "MB")
+                NumberRow(label: "Swap 3 秒内增长超过", value: $swap, unit: "MB")
+            } header: { Text("整机") } footer: {
+                SectionNote("内存占用只有在系统同时出现内存压力时才提醒——macOS 本来就会把空闲内存用作缓存。")
+            }
+            Section {
+                NumberRow(label: "应用合计 CPU 超过", value: $appCpu, unit: "%")
+                NumberRow(label: "并持续", value: $appSec, unit: "秒")
+                NumberRow(label: "单个进程 CPU 超过", value: $procCpu, unit: "%")
+                NumberRow(label: "应用网络连接超过", value: $appConn, unit: "个")
+            } header: { Text("应用") } footer: {
+                SectionNote("「应用合计」把一个应用的全部 Helper 进程加在一起算，100% = 吃满 1 个核。单个进程需持续 3 分钟才提醒。")
+            }
+            Section("通知") {
+                NumberRow(label: "同类提醒至少间隔", value: $cooldown, unit: "分钟")
+                Toggle("提示音", isOn: $sound)
+            }
+        }
+        .formStyle(.grouped)
+    }
+}
+
+struct AutoKillSettingsView: View {
+    @ObservedObject var m: Model
+    @AppStorage(AK.on) private var on = false
+    @AppStorage(AK.list) private var list = ""
+    @AppStorage(AK.cpu) private var cpu = 200.0
+    @AppStorage(AK.cpuSec) private var cpuSec = 180.0
+    @AppStorage(AK.memGB) private var memGB = 3.0
     @State private var typed = ""
 
-    private var akNames: [String] {
-        akList.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+    private var names: [String] {
+        list.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
     }
-
-    private func akAdd(_ n: String) {
+    private func add(_ n: String) {
         let n = n.trimmingCharacters(in: .whitespaces)
-        guard !n.isEmpty, !akNames.contains(n), !AK.neverKill.contains(n) else { return }
-        akList = (akNames + [n]).joined(separator: "\n")
+        guard !n.isEmpty, !names.contains(n), !AK.neverKill.contains(n) else { return }
+        list = (names + [n]).joined(separator: "\n")
     }
-
-    private func akRemove(_ n: String) {
-        akList = akNames.filter { $0 != n }.joined(separator: "\n")
-    }
-
+    private func remove(_ n: String) { list = names.filter { $0 != n }.joined(separator: "\n") }
     /// 可加入名单的：正在运行、是真正的 .app、不在禁止名单、还没加
-    private var akCandidates: [AppUsage] {
-        m.snap.apps.filter { $0.appPath != nil && !AK.neverKill.contains($0.name) && !akNames.contains($0.name) }
+    private var candidates: [AppUsage] {
+        m.snap.apps.filter { $0.appPath != nil && !AK.neverKill.contains($0.name) && !names.contains($0.name) }
             .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
 
     var body: some View {
         Form {
-            Section("系统") {
-                num("CPU 占用超过", $cpu, "%")
-                num("持续", $cpuSec, "秒后提醒")
-                num("内存占用超过", $mem, "%（且系统有内存压力）")
-                num("可用内存低于", $avail, "MB")
-                num("Swap 3 秒内增长超过", $swap, "MB")
-            }
-            Section("应用与进程") {
-                num("单个应用合计 CPU 超过", $appCpu, "%（100% = 1 个核）")
-                num("持续", $appSec, "秒后提醒")
-                num("单个进程 CPU 超过", $procCpu, "%（持续 3 分钟）")
-                num("单个应用网络连接超过", $appConn, "个")
-            }
-            Section("通知") {
-                num("同类提醒间隔", $cooldown, "分钟")
-                Toggle("提示音", isOn: $sound)
+            Section {
+                Toggle(isOn: $on) {
+                    Text("自动结束失控的应用")
+                    Text("只处理名单里的应用，而且要系统真的卡住时才动手")
+                }
             }
             Section {
-                Toggle(isOn: $akOn) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("自动结束失控应用")
-                        Text("只处理下面名单里的应用，而且要系统真的卡住时才动手").font(.caption).foregroundStyle(.secondary)
+                if names.isEmpty {
+                    Text("还没有应用。名单为空时不会自动结束任何应用。").foregroundStyle(.secondary)
+                }
+                ForEach(names, id: \.self) { n in
+                    HStack(spacing: 8) {
+                        AppIcon(m: m, path: m.snap.apps.first { $0.name == n }?.appPath, size: 20)
+                        Text(n)
+                        Spacer()
+                        Button { remove(n) } label: { Image(systemName: "minus.circle.fill").foregroundStyle(.red) }
+                            .buttonStyle(.borderless).help("移出名单")
                     }
                 }
-                if akOn {
-                    if akNames.isEmpty {
-                        Text("名单为空：不会自动结束任何应用").font(.caption).foregroundStyle(.orange)
-                    }
-                    ForEach(akNames, id: \.self) { n in
-                        HStack(spacing: 8) {
-                            AppIcon(m: m, path: m.snap.apps.first { $0.name == n }?.appPath, size: 18)
-                            Text(n)
-                            Spacer()
-                            Button { akRemove(n) } label: { Image(systemName: "minus.circle.fill").foregroundStyle(.red) }
-                                .buttonStyle(.borderless).help("移出名单")
-                        }
-                    }
-                    HStack {
-                        Menu("添加正在运行的应用") {
-                            ForEach(akCandidates, id: \.name) { a in Button(a.name) { akAdd(a.name) } }
-                        }
-                        .fixedSize()
-                        TextField("", text: $typed, prompt: Text("或输入应用名"))
-                            .textFieldStyle(.roundedBorder)
-                            .onSubmit { akAdd(typed); typed = "" }
-                    }
-                    num("应用合计 CPU 超过", $akCpu, "%（200% = 2 核）")
-                    num("且持续", $akCpuSec, "秒")
-                    num("或系统内存告急时应用占用超过", $akMem, "GB")
-                    Text("同时满足才会动手：系统真的卡（整机 CPU ≥ 80%，或内存压力严重）· 不是你正在用的前台应用 · 距上次自动结束已超过 10 分钟。会先请求正常退出，5 秒后仍未退出才强制结束，事后通知你。")
-                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                HStack {
+                    Menu {
+                        if candidates.isEmpty { Text("没有可添加的应用") }
+                        ForEach(candidates, id: \.name) { a in Button(a.name) { add(a.name) } }
+                    } label: { Label("添加正在运行的应用", systemImage: "plus") }
+                    .fixedSize()
+                    TextField("", text: $typed, prompt: Text("或输入应用名后回车"))
+                        .labelsHidden().textFieldStyle(.roundedBorder)
+                        .onSubmit { add(typed); typed = "" }
                 }
-            } header: { Text("自动处理") }
+            } header: { Text("自动处理名单") } footer: {
+                SectionNote("Finder、Dock、WindowServer、MacMon 等系统组件即使加入也不会被处理。")
+            }
+            .disabled(!on)
             Section {
-                Toggle(isOn: Binding(get: { m.agentOn }, set: { _ in m.toggleAgent() })) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("守护模式")
-                        Text("开机自动启动；MacMon 崩溃或卡住时自动重启").font(.caption).foregroundStyle(.secondary)
-                    }
-                }
-            } header: { Text("运行") }
+                NumberRow(label: "应用合计 CPU 超过", value: $cpu, unit: "%")
+                NumberRow(label: "并持续", value: $cpuSec, unit: "秒")
+                NumberRow(label: "或内存告急时应用占用超过", value: $memGB, unit: "GB")
+            } header: { Text("触发条件") } footer: {
+                SectionNote("还必须同时满足：整机 CPU ≥ 80% 或内存压力严重 · 不是你正在使用的前台应用 · 距上次自动结束超过 10 分钟。会先请求正常退出（可保存），5 秒后仍未退出才强制结束，并通知你。")
+            }
+            .disabled(!on)
         }
         .formStyle(.grouped)
-        .frame(width: 460)
-        .fixedSize(horizontal: false, vertical: true)
     }
+}
 
-    private func num(_ label: String, _ v: Binding<Double>, _ unit: String) -> some View {
-        LabeledContent(label) {
-            HStack(spacing: 6) {
-                TextField("", value: v, format: .number)
-                    .multilineTextAlignment(.trailing).frame(width: 64).textFieldStyle(.roundedBorder)
-                Text(unit).foregroundStyle(.secondary).frame(minWidth: 0, alignment: .leading)
+struct GeneralSettingsView: View {
+    @ObservedObject var m: Model
+    var body: some View {
+        Form {
+            Section {
+                Toggle(isOn: Binding(get: { m.agentOn }, set: { _ in m.toggleAgent() })) {
+                    Text("守护模式")
+                    Text("开机自动启动；MacMon 崩溃或卡住时自动重启")
+                }
+                Toggle(isOn: Binding(get: { m.paused }, set: { _ in m.togglePause() })) {
+                    Text("暂停监控")
+                    Text("暂停期间不提醒、不自动处理，仍显示数据")
+                }
+            } header: { Text("运行") }
+            Section {
+                LabeledContent("报警日志") {
+                    Button("在访达中显示") { m.revealLog() }
+                }
+                LabeledContent("通知") {
+                    Button("发送测试通知") { m.testNotify() }
+                }
+            } header: { Text("工具") }
+            Section {
+                LabeledContent("版本", value: VERSION)
+                LabeledContent("MacMon 自身") {
+                    Text(String(format: "CPU %.1f%% · 内存 %@", m.snap.me.cpuPct, bytes(m.snap.me.footprint)))
+                        .monospacedDigit().foregroundStyle(.secondary)
+                }
+            } header: { Text("关于") } footer: {
+                SectionNote("看门狗守护中：MacMon 自身卡住超过 20 秒会自动重启。")
             }
         }
+        .formStyle(.grouped)
     }
 }
 

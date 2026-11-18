@@ -11,7 +11,7 @@ import Foundation
 import Darwin
 import IOKit
 
-let VERSION = "2.0.0"
+let VERSION = "2.1.0"
 
 // MARK: - 配置
 

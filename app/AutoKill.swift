@@ -141,23 +141,32 @@ final class AutoKiller {
     }
 }
 
-/// 结束一个应用：先正常退出，5 秒后强制。完成后回调（在主线程）告知是否用了强制。
-func terminateApp(_ a: AppUsage, completion: @escaping (_ forced: Int) -> Void) {
+/// 结束一组进程：GUI 应用先走正常“退出”（等同 ⌘Q，可保存），其余发 SIGTERM；grace 秒后仍在就 SIGKILL。
+/// completion 在主线程回调：forced = 被强制结束的进程数，denied = 全部无权限。
+func terminatePids(_ pids: [pid_t], grace: Double = 5, completion: @escaping (_ forced: Int, _ denied: Bool) -> Void) {
     let me = getpid()
-    let pids = a.pids.filter { $0 > 1 && $0 != me }
+    let targets = pids.filter { $0 > 1 && $0 != me }
     DispatchQueue.main.async {
-        // GUI 应用走正常“退出”（等同 ⌘Q，可触发保存）；其余发 SIGTERM
+        guard !targets.isEmpty else { completion(0, false); return }
         var asked = false
-        for p in pids {
+        for p in targets {
             if let ra = NSRunningApplication(processIdentifier: p), ra.activationPolicy != .prohibited {
                 asked = ra.terminate() || asked
             }
         }
-        if !asked { pids.forEach { kill($0, SIGTERM) } }
-        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 5) {
-            let alive = pids.filter { kill($0, 0) == 0 }
+        if !asked {
+            var denied = 0
+            for p in targets where kill(p, SIGTERM) != 0 && errno == EPERM { denied += 1 }
+            if denied == targets.count { completion(0, true); return }
+        }
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + grace) {
+            let alive = targets.filter { kill($0, 0) == 0 }
             alive.forEach { kill($0, SIGKILL) }
-            DispatchQueue.main.async { completion(alive.count) }
+            DispatchQueue.main.async { completion(alive.count, false) }
         }
     }
+}
+
+func terminateApp(_ a: AppUsage, completion: @escaping (_ forced: Int) -> Void) {
+    terminatePids(a.pids) { forced, _ in completion(forced) }
 }
