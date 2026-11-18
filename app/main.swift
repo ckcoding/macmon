@@ -219,9 +219,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
     var tickN = 0
     var prevSelfCPU = selfCPUSeconds()
     var prevSelfWall = monoNow()
+    let autoKiller = AutoKiller()
 
     // —— 跨线程 ——
     let paused = Atomic(false)
+    /// 当前最前台应用（主线程通过系统通知更新，采样队列只读）
+    let frontPid = Atomic<pid_t>(0)
+    let frontPath = Atomic<String?>(nil)
     let watchdog = Watchdog()
     var logger: Logger!
 
@@ -254,6 +258,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
         }
 
         wireModel()
+        trackFrontmost()
         setupStatusItem()
 
         popover.behavior = .transient
@@ -309,6 +314,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
             NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: macmonDir + "/macmon.log")])
         }
         model.quit = { NSApp.terminate(nil) }
+    }
+
+    private func trackFrontmost() {
+        let update: (NSRunningApplication?) -> Void = { [weak self] ra in
+            self?.frontPid.value = ra?.processIdentifier ?? 0
+            self?.frontPath.value = ra?.bundleURL?.path
+        }
+        update(NSWorkspace.shared.frontmostApplication)
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { n in
+            update(n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)
+        }
     }
 
     private func setupStatusItem() {
@@ -397,6 +414,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
         snap.topCpu = top
         snap.apps = engine.lastApps.isEmpty ? groupByApp(top) : engine.lastApps
         snap.thermal = ProcessInfo.processInfo.thermalState
+
+        // —— 自动处理（默认关闭；只处理名单内应用）——
+        if !paused.value,
+           let (victim, reason) = autoKiller.decide(cfg: AutoKillConfig.load(), apps: snap.apps, cpu: cpu, mem: mem,
+                                                    frontPid: frontPid.value, frontPath: frontPath.value) {
+            logger.write("🤖 自动结束 \(victim.name)（\(victim.pids.count) 个进程）— \(reason)")
+            terminateApp(victim) { [weak self] forced in
+                let how = forced > 0 ? "正常退出无响应，已强制结束" : "已正常退出"
+                self?.logger.write("🤖 \(victim.name) \(how)")
+                self?.postUN("macmon.autokill.\(victim.name)", "🤖 已自动结束 \(victim.name)",
+                             "\(reason)。\n\(how)。可在设置 → 自动处理 中调整或关闭。")
+            }
+        }
         if cpu != nil {
             history.add(cpu: snap.busy, mem: snap.memFrac * 100, net: net, io: io)
         }
@@ -527,12 +557,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
                              styleMask: [.titled, .closable], backing: .buffered, defer: false)
             w.title = "MacMon 设置"
             w.isReleasedWhenClosed = false
-            let hv = NSHostingView(rootView: SettingsView(m: model))
-            w.contentView = hv
-            w.setContentSize(hv.fittingSize)
+            let hc = NSHostingController(rootView: SettingsView(m: model))
+            hc.sizingOptions = .preferredContentSize   // 展开/收起「自动处理」时窗口自动跟着变高
+            w.contentViewController = hc
             w.center()
             settingsWindow = w
         }
+        model.snap = latest   // 让「添加正在运行的应用」列表是最新的
         NSApp.activate(ignoringOtherApps: true)
         settingsWindow?.makeKeyAndOrderFront(nil)
     }

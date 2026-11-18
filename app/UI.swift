@@ -842,6 +842,32 @@ struct SettingsView: View {
     @AppStorage(K.appConn) private var appConn = 500.0
     @AppStorage(K.cooldownMin) private var cooldown = 10.0
     @AppStorage(K.soundOn) private var sound = true
+    @AppStorage(AK.on) private var akOn = false
+    @AppStorage(AK.list) private var akList = ""
+    @AppStorage(AK.cpu) private var akCpu = 200.0
+    @AppStorage(AK.cpuSec) private var akCpuSec = 180.0
+    @AppStorage(AK.memGB) private var akMem = 3.0
+    @State private var typed = ""
+
+    private var akNames: [String] {
+        akList.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+    }
+
+    private func akAdd(_ n: String) {
+        let n = n.trimmingCharacters(in: .whitespaces)
+        guard !n.isEmpty, !akNames.contains(n), !AK.neverKill.contains(n) else { return }
+        akList = (akNames + [n]).joined(separator: "\n")
+    }
+
+    private func akRemove(_ n: String) {
+        akList = akNames.filter { $0 != n }.joined(separator: "\n")
+    }
+
+    /// 可加入名单的：正在运行、是真正的 .app、不在禁止名单、还没加
+    private var akCandidates: [AppUsage] {
+        m.snap.apps.filter { $0.appPath != nil && !AK.neverKill.contains($0.name) && !akNames.contains($0.name) }
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
 
     var body: some View {
         Form {
@@ -862,6 +888,42 @@ struct SettingsView: View {
                 num("同类提醒间隔", $cooldown, "分钟")
                 Toggle("提示音", isOn: $sound)
             }
+            Section {
+                Toggle(isOn: $akOn) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("自动结束失控应用")
+                        Text("只处理下面名单里的应用，而且要系统真的卡住时才动手").font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                if akOn {
+                    if akNames.isEmpty {
+                        Text("名单为空：不会自动结束任何应用").font(.caption).foregroundStyle(.orange)
+                    }
+                    ForEach(akNames, id: \.self) { n in
+                        HStack(spacing: 8) {
+                            AppIcon(m: m, path: m.snap.apps.first { $0.name == n }?.appPath, size: 18)
+                            Text(n)
+                            Spacer()
+                            Button { akRemove(n) } label: { Image(systemName: "minus.circle.fill").foregroundStyle(.red) }
+                                .buttonStyle(.borderless).help("移出名单")
+                        }
+                    }
+                    HStack {
+                        Menu("添加正在运行的应用") {
+                            ForEach(akCandidates, id: \.name) { a in Button(a.name) { akAdd(a.name) } }
+                        }
+                        .fixedSize()
+                        TextField("", text: $typed, prompt: Text("或输入应用名"))
+                            .textFieldStyle(.roundedBorder)
+                            .onSubmit { akAdd(typed); typed = "" }
+                    }
+                    num("应用合计 CPU 超过", $akCpu, "%（200% = 2 核）")
+                    num("且持续", $akCpuSec, "秒")
+                    num("或系统内存告急时应用占用超过", $akMem, "GB")
+                    Text("同时满足才会动手：系统真的卡（整机 CPU ≥ 80%，或内存压力严重）· 不是你正在用的前台应用 · 距上次自动结束已超过 10 分钟。会先请求正常退出，5 秒后仍未退出才强制结束，事后通知你。")
+                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }
+            } header: { Text("自动处理") }
             Section {
                 Toggle(isOn: Binding(get: { m.agentOn }, set: { _ in m.toggleAgent() })) {
                     VStack(alignment: .leading, spacing: 2) {
