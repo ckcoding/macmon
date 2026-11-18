@@ -1,0 +1,6 @@
+# 编译产物（./build.sh 生成）
+/macmon
+/MacMon.app/
+*.o
+.build/
+.DS_Store
