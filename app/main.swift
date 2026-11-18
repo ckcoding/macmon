@@ -254,7 +254,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
         let logger = self.logger!
         engine = Engine(cfg: Config.load(.standard)) { [weak self] category, title, body in
             logger.write("⚠️ \(title) — \(body.replacingOccurrences(of: "\n", with: " / "))")
-            DispatchQueue.main.async { self?.postUN("macmon.alert.\(category)", title, body) }
+            DispatchQueue.main.async { self?.notify(category, title, body) }
         }
 
         wireModel()
@@ -282,8 +282,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
 
         UNUserNotificationCenter.current().delegate = self
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { [weak self] granted, _ in
-            guard granted else { return }
-            DispatchQueue.main.async { self?.postStartupNotes() }
+            // 没授权也要走一遍：自我恢复的消息还要推给 Webhook
+            DispatchQueue.main.async { self?.postStartupNotes(granted: granted) }
         }
 
         startTick()
@@ -344,13 +344,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
         b.attributedTitle = NSAttributedString(string: "")
     }
 
-    private func postStartupNotes() {
+    private func postStartupNotes(granted: Bool) {
         if let reason = try? String(contentsOfFile: restartMarker, encoding: .utf8) {
             try? FileManager.default.removeItem(atPath: restartMarker)
             logger.write("🛡 上次自动重启原因：\(reason)")
-            postUN("macmon.selfrestart", "🛡 MacMon 已自我恢复", "检测到自身异常并自动重启：\(reason)")
+            notify("selfrestart", "🛡 MacMon 已自我恢复", "检测到自身异常并自动重启：\(reason)")
         }
-        if !UserDefaults.standard.bool(forKey: K.welcomed) {
+        if granted, !UserDefaults.standard.bool(forKey: K.welcomed) {
             UserDefaults.standard.set(true, forKey: K.welcomed)
             postUN("macmon.welcome", "👋 MacMon 已开始监控",
                    "CPU / 内存 / 网络 / 磁盘异常时会在这里提醒你。\n点菜单栏图标查看详情。")
@@ -425,7 +425,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
             terminateApp(victim) { [weak self] forced in
                 let how = forced > 0 ? "正常退出无响应，已强制结束" : "已正常退出"
                 self?.logger.write("🤖 \(victim.name) \(how)")
-                self?.postUN("macmon.autokill.\(victim.name)", "🤖 已自动结束 \(victim.name)",
+                self?.notify("autokill.\(victim.name)", "🤖 已自动结束 \(victim.name)",
                              "\(reason)。\n\(how)。可在设置 → 自动处理 中调整或关闭。")
             }
         }
@@ -592,7 +592,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
                 item.image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)
                 tabs.addTabViewItem(item)
             }
-            page("提醒", "bell.badge", AlertSettingsView())
+            page("阈值", "gauge.with.dots.needle.67percent", AlertSettingsView())
+            page("通知", "bell.badge", NotifySettingsView(m: model))
             page("自动处理", "bolt.shield", AutoKillSettingsView(m: model))
             page("通用", "gearshape", GeneralSettingsView(m: model))
 
@@ -614,6 +615,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
     }
 
     // ---------- 通知 ----------
+
+    /// 报警类事件出口：本机通知（可在设置里关）+ 所有已启用的 Webhook
+    private func notify(_ category: String, _ title: String, _ body: String) {
+        let d = UserDefaults.standard
+        if d.object(forKey: Hooks.localOn) == nil || d.bool(forKey: Hooks.localOn) {
+            postUN("macmon.alert.\(category)", title, body)
+        }
+        let logger = self.logger
+        WebhookSender.shared.broadcast(category: category, title: title, body: body) { logger?.write($0) }
+    }
 
     private func postUN(_ id: String, _ title: String, _ body: String) {
         let content = UNMutableNotificationContent()

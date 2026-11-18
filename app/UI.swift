@@ -937,8 +937,6 @@ struct AlertSettingsView: View {
     @AppStorage(K.appCpu) private var appCpu = 100.0
     @AppStorage(K.appSustainSec) private var appSec = 60.0
     @AppStorage(K.appConn) private var appConn = 500.0
-    @AppStorage(K.cooldownMin) private var cooldown = 10.0
-    @AppStorage(K.soundOn) private var sound = true
 
     var body: some View {
         Form {
@@ -959,12 +957,122 @@ struct AlertSettingsView: View {
             } header: { Text("应用") } footer: {
                 SectionNote("「应用合计」把一个应用的全部 Helper 进程加在一起算，100% = 吃满 1 个核。单个进程需持续 3 分钟才提醒。")
             }
-            Section("通知") {
+        }
+        .formStyle(.grouped)
+    }
+}
+
+// MARK: - 通知设置（本机通知 + Webhook）
+
+struct NotifySettingsView: View {
+    @ObservedObject var m: Model
+    @AppStorage(Hooks.localOn) private var localOn = true
+    @AppStorage(K.soundOn) private var sound = true
+    @AppStorage(K.cooldownMin) private var cooldown = 10.0
+    @State private var hooks: [Webhook] = Hooks.load()
+    @State private var expanded: Set<UUID> = []
+    @State private var results: [UUID: (Bool, String)] = [:]
+    @State private var testing: Set<UUID> = []
+
+    var body: some View {
+        Form {
+            Section {
+                Toggle(isOn: $localOn) {
+                    Text("系统通知")
+                    Text("在本机通知中心弹出提醒")
+                }
+                Toggle("提示音", isOn: $sound).disabled(!localOn)
                 NumberRow(label: "同类提醒至少间隔", value: $cooldown, unit: "分钟")
-                Toggle("提示音", isOn: $sound)
+                LabeledContent("") { Button("发送测试通知") { m.testNotify() } }
+            } header: { Text("本机") }
+
+            Section {
+                if hooks.isEmpty {
+                    Text("还没有 Webhook。添加后，报警、自动结束应用、MacMon 自我恢复都会同时推送到群里。")
+                        .foregroundStyle(.secondary)
+                }
+                ForEach($hooks) { $h in hookRow($h) }
+                Menu {
+                    ForEach(HookKind.allCases) { k in
+                        Button { add(k) } label: { Label(k.title, systemImage: k.symbol) }
+                    }
+                } label: { Label("添加 Webhook", systemImage: "plus") }
+                .fixedSize()
+            } header: { Text("Webhook 推送") } footer: {
+                SectionNote("推送内容带电脑名称「\(computerName)」。请求在后台发送，8 秒超时，网络不通时直接放弃，不会影响 MacMon。地址里的密钥保存在本机偏好设置中。")
             }
         }
         .formStyle(.grouped)
+        .onChange(of: hooks) { _, v in Hooks.save(v) }
+    }
+
+    private func add(_ k: HookKind) {
+        let h = Webhook(kind: k)
+        hooks.append(h)
+        expanded.insert(h.id)
+    }
+
+    @ViewBuilder
+    private func hookRow(_ h: Binding<Webhook>) -> some View {
+        let id = h.wrappedValue.id
+        let isOpen = Binding(get: { expanded.contains(id) },
+                             set: { if $0 { expanded.insert(id) } else { expanded.remove(id) } })
+        DisclosureGroup(isExpanded: isOpen) {
+            VStack(alignment: .leading, spacing: 8) {
+                Picker("类型", selection: h.kind) {
+                    ForEach(HookKind.allCases) { Text($0.title).tag($0) }
+                }
+                TextField("地址", text: h.url, prompt: Text(h.wrappedValue.kind.placeholder))
+                    .textFieldStyle(.roundedBorder)
+                if h.wrappedValue.kind.hasSecret {
+                    SecureField("加签密钥", text: h.secret, prompt: Text("可选：开了「加签 / 签名校验」才需要"))
+                        .textFieldStyle(.roundedBorder)
+                }
+                SectionNote(h.wrappedValue.kind.howTo)
+                HStack {
+                    Button {
+                        Task { await test(h.wrappedValue) }
+                    } label: {
+                        if testing.contains(id) { ProgressView().controlSize(.small) } else { Text("发送测试消息") }
+                    }
+                    .disabled(h.wrappedValue.url.isEmpty || testing.contains(id))
+                    Spacer()
+                    Button(role: .destructive) {
+                        hooks.removeAll { $0.id == id }
+                        results[id] = nil
+                    } label: { Text("删除") }
+                }
+            }
+            .padding(.top, 4)
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: h.wrappedValue.kind.symbol).foregroundStyle(Color.accentColor).frame(width: 18)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(h.wrappedValue.kind.title)
+                    Text(h.wrappedValue.url.isEmpty ? "未填写地址" : shortURL(h.wrappedValue.url))
+                        .font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                    if let r = results[id] {
+                        Label(r.1, systemImage: r.0 ? "checkmark.circle.fill" : "xmark.octagon.fill")
+                            .font(.caption).foregroundStyle(r.0 ? .green : .red).lineLimit(2)
+                    }
+                }
+                Spacer()
+                Toggle("", isOn: h.enabled).labelsHidden().toggleStyle(.switch).controlSize(.small)
+            }
+        }
+    }
+
+    private func test(_ h: Webhook) async {
+        testing.insert(h.id)
+        let r = await WebhookSender.shared.test(h)
+        testing.remove(h.id)
+        results[h.id] = r
+    }
+
+    /// 只显示主机名 + 路径开头，不把 key / token 明文露在列表里
+    private func shortURL(_ s: String) -> String {
+        guard let u = URL(string: s), let host = u.host else { return s }
+        return host + (u.path.isEmpty ? "" : u.path.prefix(24)) + (u.query == nil ? "" : "?…")
     }
 }
 

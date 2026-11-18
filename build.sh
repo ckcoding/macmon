@@ -11,7 +11,7 @@ APP=MacMon.app
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 swiftc -O -swift-version 5 Sources/*.swift app/*.swift -o "$APP/Contents/MacOS/MacMon" \
-    -framework AppKit -framework SwiftUI -framework UserNotifications -framework ServiceManagement -framework IOKit
+    -framework AppKit -framework SwiftUI -framework UserNotifications -framework ServiceManagement -framework IOKit -framework SystemConfiguration
 cp app/Info.plist "$APP/Contents/Info.plist"
 cp app/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 codesign --force --sign - "$APP" 2>/dev/null || true
@@ -26,6 +26,9 @@ if [[ "${1:-}" == "install" ]]; then
     sleep 1
     rm -rf /Applications/MacMon.app
     cp -R "$APP" /Applications/
+    LSREG=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+    "$LSREG" -u "$(pwd)/$APP" 2>/dev/null || true      # 只保留 /Applications 这一份，通知图标才不会错乱
+    "$LSREG" -f /Applications/MacMon.app 2>/dev/null || true
     if [[ -f "$HOME/Library/LaunchAgents/com.ck.macmon.app.agent.plist" ]]; then
         launchctl kickstart -k "gui/$(id -u)/com.ck.macmon.app.agent" 2>/dev/null || true
     else
