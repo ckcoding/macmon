@@ -22,6 +22,8 @@ let agentLabel = "com.ck.macmon.app.agent"
 let underAgent = ProcessInfo.processInfo.environment["MACMON_AGENT"] == "1"
 let launchedAsRestart = CommandLine.arguments.contains("--restarted")
 let showNoteName = Notification.Name("com.ck.macmon.show")
+let preKillCategory = "macmon.prekill"
+let keepActionID = "macmon.keep"
 let macmonDir = expandPath("~/.macmon")
 let restartMarker = macmonDir + "/last_restart.txt"
 let agentPlistPath = expandPath("~/Library/LaunchAgents/\(agentLabel).plist")
@@ -223,6 +225,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
 
     // —— 跨线程 ——
     let paused = Atomic(false)
+    /// 用户在「即将结束」通知上点了「保留」的应用名（主线程写，tickQ 读）
+    let keepRequests = Atomic<Set<String>>([])
+    let autoKillGrace = 10.0
     /// 当前最前台应用（主线程通过系统通知更新，采样队列只读）
     let frontPid = Atomic<pid_t>(0)
     let frontPath = Atomic<String?>(nil)
@@ -274,6 +279,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
             forName: Notification.Name("com.ck.macmon.window"), object: nil, queue: .main) { [weak self] _ in self?.showDashboard() }
         DistributedNotificationCenter.default().addObserver(
             forName: Notification.Name("com.ck.macmon.settings"), object: nil, queue: .main) { [weak self] _ in self?.showSettings() }
+        // 调试：模拟在「即将结束」通知上点「保留」（只能取消、不能触发结束）
+        DistributedNotificationCenter.default().addObserver(
+            forName: Notification.Name("com.ck.macmon.keep"), object: nil, queue: .main) { [weak self] n in
+            if let name = n.object as? String { self?.keepRequests.value.insert(name); self?.logger.write("🤖 收到「保留 \(name)」（调试）") }
+        }
         // 调试：把弹窗/窗口自己渲染成 PNG（无需屏幕录制权限）→ ~/.macmon/shot-*.png
         DistributedNotificationCenter.default().addObserver(
             forName: Notification.Name("com.ck.macmon.snapshot"), object: nil, queue: .main) { [weak self] _ in MainActor.assumeIsolated {
@@ -281,6 +291,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
         }
 
         UNUserNotificationCenter.current().delegate = self
+        let keep = UNNotificationAction(identifier: keepActionID, title: "保留", options: [])
+        UNUserNotificationCenter.current().setNotificationCategories([
+            UNNotificationCategory(identifier: preKillCategory, actions: [keep], intentIdentifiers: [], options: []),
+        ])
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { [weak self] granted, _ in
             // 没授权也要走一遍：自我恢复的消息还要推给 Webhook
             DispatchQueue.main.async { self?.postStartupNotes(granted: granted) }
@@ -310,7 +324,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
         }
         model.toggleAgent = { [weak self] in self?.toggleAgent() }
         model.testNotify = { [weak self] in
-            self?.postUN("macmon.test", "✅ MacMon 通知通道正常", "之后 CPU / 内存 / Swap 异常都会这样提醒你。")
+            self?.postUN("macmon.test", "✅ MacMon 通知通道正常", "自动结束应用前会这样提醒你（带「保留」按钮）。")
         }
         model.revealLog = {
             NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: macmonDir + "/macmon.log")])
@@ -421,13 +435,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
         if !paused.value,
            let (victim, reason) = autoKiller.decide(cfg: AutoKillConfig.load(), apps: snap.apps, cpu: cpu, mem: mem,
                                                     frontPid: frontPid.value, frontPath: frontPath.value) {
-            logger.write("🤖 自动结束 \(victim.name)（\(victim.pids.count) 个进程）— \(reason)")
-            terminateApp(victim) { [weak self] forced in
-                let how = forced > 0 ? "正常退出无响应，已强制结束" : "已正常退出"
-                self?.logger.write("🤖 \(victim.name) \(how)")
-                self?.notify("autokill.\(victim.name)", "🤖 已自动结束 \(victim.name)",
-                             "\(reason)。\n\(how)。可在设置 → 自动处理 中调整或关闭。")
-            }
+            let grace = autoKillGrace
+            logger.write("🤖 即将自动结束 \(victim.name)（\(victim.pids.count) 个进程）— \(reason)；\(Int(grace)) 秒后执行")
+            keepRequests.value.remove(victim.name)
+            DispatchQueue.main.async { [weak self] in self?.notifyPreKill(victim.name, reason: reason, grace: grace) }
+            tickQ.asyncAfter(deadline: .now() + grace) { [weak self] in self?.executeAutoKill(victim) }
         }
         if cpu != nil {
             history.add(cpu: snap.busy, mem: snap.memFrac * 100, net: net, io: io)
@@ -616,9 +628,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
 
     // ---------- 通知 ----------
 
-    /// 报警类事件出口：本机通知（可在设置里关）+ 所有已启用的 Webhook
+    /// 倒计时结束后执行（在 tickQ 上）：用户点了「保留」/ 切到了前台 / 已自行退出 → 不结束
+    private func executeAutoKill(_ victim: AppUsage) {
+        let name = victim.name
+        if keepRequests.value.contains(name) {
+            keepRequests.value.remove(name)
+            autoKiller.exempt(name, for: 1800)
+            logger.write("🤖 已取消自动结束 \(name)：你选择了保留（30 分钟内不再处理它）")
+            return
+        }
+        if victim.pids.contains(frontPid.value) || (frontPath.value != nil && victim.appPath == frontPath.value) {
+            autoKiller.exempt(name, for: 600)
+            logger.write("🤖 已取消自动结束 \(name)：倒计时期间你切到了它（10 分钟内不再处理它）")
+            return
+        }
+        var v = victim
+        v.pids = victim.pids.filter { kill($0, 0) == 0 }
+        guard !v.pids.isEmpty else {
+            autoKiller.finished(name)
+            logger.write("🤖 \(name) 在倒计时期间已自行退出")
+            return
+        }
+        terminateApp(v) { [weak self] forced in
+            self?.logger.write("🤖 \(name) " + (forced > 0 ? "正常退出无响应，已强制结束" : "已正常退出"))
+        }
+    }
+
+    /// 自动结束前的唯一一条通知（带「保留」按钮），同时推给 Webhook
+    private func notifyPreKill(_ name: String, reason: String, grace: Double) {
+        let title = "⏳ 即将结束 \(name)"
+        let body = "\(reason)。\n\(Int(grace)) 秒后自动结束；点「保留」可取消。"
+        let d = UserDefaults.standard
+        if d.object(forKey: Hooks.localOn) == nil || d.bool(forKey: Hooks.localOn) {
+            let c = UNMutableNotificationContent()
+            c.title = title
+            c.body = body
+            c.categoryIdentifier = preKillCategory
+            c.userInfo = ["app": name]
+            c.interruptionLevel = .timeSensitive
+            if d.object(forKey: K.soundOn) == nil || d.bool(forKey: K.soundOn) { c.sound = .default }
+            UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: "macmon.prekill.\(name)", content: c, trigger: nil))
+        }
+        let logger = self.logger
+        WebhookSender.shared.broadcast(category: "prekill", title: title,
+                                       body: "\(reason)。\(Int(grace)) 秒后自动结束（可在电脑上的通知里点「保留」取消）。") { logger?.write($0) }
+    }
+
+    /// 资源报警出口：默认只写日志；在 设置 → 通知 打开「资源报警」后才发本机通知 / Webhook
     private func notify(_ category: String, _ title: String, _ body: String) {
         let d = UserDefaults.standard
+        guard d.bool(forKey: Hooks.alertsOn) else { return }
         if d.object(forKey: Hooks.localOn) == nil || d.bool(forKey: Hooks.localOn) {
             postUN("macmon.alert.\(category)", title, body)
         }
@@ -645,7 +704,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
     func userNotificationCenter(_ center: UNUserNotificationCenter,
                                 didReceive response: UNNotificationResponse,
                                 withCompletionHandler completionHandler: @escaping () -> Void) {
-        DispatchQueue.main.async { [weak self] in self?.showDashboard() }   // 点通知 → 打开监控窗口
+        if response.actionIdentifier == keepActionID,
+           let name = response.notification.request.content.userInfo["app"] as? String {
+            keepRequests.value.insert(name)   // 倒计时结束时会看到并取消
+            logger.write("🤖 收到「保留 \(name)」")
+        } else {
+            DispatchQueue.main.async { [weak self] in self?.showDashboard() }   // 点通知 → 打开监控窗口
+        }
         completionHandler()
     }
 
@@ -673,8 +738,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSW
             }
             self.logger.write(text)
             self.model.showToast(text, ok: ok)
-            // 弹窗/窗口已关上看不到提示时，才发系统通知
-            if !self.uiVisible { self.postUN("macmon.kill.\(name)", ok ? "✅ \(text)" : "⛔️ \(text)", "") }
         }
     }
 

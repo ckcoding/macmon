@@ -71,7 +71,19 @@ final class AutoKiller {
     private var memSince: [String: Double] = [:]
     private var misses: [String: Int] = [:]
     private var lastKill = -1e9
-    private var dying: [String: Double] = [:]   // 刚下令结束的应用 → 时间
+    private var dying: [String: Double] = [:]   // 刚下令结束的应用 → 时间（含 10 秒倒计时）
+    private var exemptUntil: [String: Double] = [:]   // 用户点了「保留」/ 切到了前台 → 暂时豁免到此时刻
+
+    /// 本次不结束，并在 seconds 秒内不再考虑这个应用
+    func exempt(_ name: String, for seconds: Double) {
+        exemptUntil[name] = monoNow() + seconds
+        dying[name] = nil
+        cpuSince[name] = nil
+        memSince[name] = nil
+    }
+
+    /// 倒计时结束（无论是否真的结束了）后清除“正在结束”标记
+    func finished(_ name: String) { dying[name] = nil }
 
     /// 返回本轮应自动结束的应用及原因（最多 1 个）；不满足条件返回 nil
     func decide(cfg: AutoKillConfig, apps: [AppUsage], cpu: CPUSnap?, mem: MemSnap?,
@@ -94,10 +106,11 @@ final class AutoKiller {
         memSince = memSince.filter { present.contains($0.key) }
         misses = misses.filter { present.contains($0.key) }
 
-        dying = dying.filter { now - $0.value < 15 }
+        dying = dying.filter { now - $0.value < 40 }   // 10 秒倒计时 + 5 秒强制 + 余量
+        exemptUntil = exemptUntil.filter { $0.value > now }
         for a in apps where cfg.names.contains(a.name) && !AK.neverKill.contains(a.name) {
-            // 正在被结束的（等待强制的 5 秒内）不重新计时
-            if dying[a.name] != nil { cpuSince[a.name] = nil; memSince[a.name] = nil; continue }
+            // 正在被结束（倒计时 / 等待强制）或用户刚选择保留的，不重新计时
+            if dying[a.name] != nil || exemptUntil[a.name] != nil { cpuSince[a.name] = nil; memSince[a.name] = nil; continue }
             // —— CPU 路线（允许偶尔 1 次采样掉下去，避免抖动清零）——
             let cpuHot = busy >= cfg.sysBusy && a.pct >= cfg.cpuPct
             if cpuHot {

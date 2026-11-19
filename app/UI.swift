@@ -967,6 +967,7 @@ struct AlertSettingsView: View {
 struct NotifySettingsView: View {
     @ObservedObject var m: Model
     @AppStorage(Hooks.localOn) private var localOn = true
+    @AppStorage(Hooks.alertsOn) private var alertsOn = false
     @AppStorage(K.soundOn) private var sound = true
     @AppStorage(K.cooldownMin) private var cooldown = 10.0
     @State private var hooks: [Webhook] = Hooks.load()
@@ -982,13 +983,25 @@ struct NotifySettingsView: View {
                     Text("在本机通知中心弹出提醒")
                 }
                 Toggle("提示音", isOn: $sound).disabled(!localOn)
-                NumberRow(label: "同类提醒至少间隔", value: $cooldown, unit: "分钟")
                 LabeledContent("") { Button("发送测试通知") { m.testNotify() } }
             } header: { Text("本机") }
 
             Section {
+                LabeledContent("即将自动结束应用") {
+                    Text("始终通知").foregroundStyle(.secondary)
+                }
+                Toggle(isOn: $alertsOn) {
+                    Text("资源报警")
+                    Text("CPU / 内存 / Swap / 磁盘 / 应用占用过高、MacMon 自我恢复")
+                }
+                NumberRow(label: "同类报警至少间隔", value: $cooldown, unit: "分钟").disabled(!alertsOn)
+            } header: { Text("通知哪些事") } footer: {
+                SectionNote("默认只在自动结束应用前 10 秒通知一次，可在通知上点「保留」取消。资源报警关闭时仍会写入日志、显示在菜单栏弹窗里。")
+            }
+
+            Section {
                 if hooks.isEmpty {
-                    Text("还没有 Webhook。添加后，报警、自动结束应用、MacMon 自我恢复都会同时推送到群里。")
+                    Text("还没有 Webhook。添加后，「通知哪些事」里开启的通知会同时推送到群里。")
                         .foregroundStyle(.secondary)
                 }
                 ForEach($hooks) { $h in hookRow($h) }
@@ -1140,7 +1153,7 @@ struct AutoKillSettingsView: View {
                 NumberRow(label: "并持续", value: $cpuSec, unit: "秒")
                 NumberRow(label: "或内存告急时应用占用超过", value: $memGB, unit: "GB")
             } header: { Text("触发条件") } footer: {
-                SectionNote("还必须同时满足：整机 CPU ≥ 80% 或内存压力严重 · 不是你正在使用的前台应用 · 距上次自动结束超过 10 分钟。会先请求正常退出（可保存），5 秒后仍未退出才强制结束，并通知你。")
+                SectionNote("还必须同时满足：整机 CPU ≥ 80% 或内存压力严重 · 不是你正在使用的前台应用 · 距上次自动结束超过 10 分钟。动手前 10 秒会通知你，可点「保留」取消（30 分钟内不再处理它）；倒计时期间切到该应用也会取消。之后先请求正常退出（可保存），5 秒后仍未退出才强制结束。")
             }
             .disabled(!on)
         }

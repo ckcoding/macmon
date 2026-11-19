@@ -64,6 +64,8 @@ struct Webhook: Codable, Identifiable, Equatable {
 enum Hooks {
     static let key = "webhooks"
     static let localOn = "systemNotifyOn"
+    /// 资源报警（CPU/内存/Swap/磁盘/自我恢复…）是否通知；默认关闭，只在即将自动结束应用前通知
+    static let alertsOn = "alertNotifyOn"
 
     static func load(_ d: UserDefaults = .standard) -> [Webhook] {
         guard let data = d.data(forKey: key), let v = try? JSONDecoder().decode([Webhook].self, from: data) else { return [] }
